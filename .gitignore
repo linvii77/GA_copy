@@ -1,0 +1,14 @@
+# Large data and model directories (too large for GitHub)
+data/
+model/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Claude internal
+.claude/
