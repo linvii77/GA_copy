@@ -216,7 +216,7 @@ class Decoder(nn.Module):
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
-    def forward(self, features):
+    def forward(self, features, return_features=False):
         x1 = features[0]
         x2 = features[1]
         x3 = features[2]
@@ -242,6 +242,8 @@ class Decoder(nn.Module):
         if self.has_dropout:
             x9 = self.dropout(x9)
         out_seg = self.out_conv(x9)
+        if return_features:
+            return out_seg, x9, x6  # x6: 128ch at 1/8 resolution, used by VAPL/SCDL
         return out_seg, x9
 
 
@@ -280,14 +282,12 @@ class VNet_Magic(nn.Module):
     def forward_decoder(self, feat_list):
         return self.decoder(feat_list)
 
-    def forward(self, input):
+    def forward(self, input, return_features=False):
         features = self.encoder(input)
+        if return_features:
+            out_seg, embedding, feat_x6 = self.decoder(features, return_features=True)
+            return out_seg, embedding, feat_x6  # feat_x6: 128ch at 1/8 res for VAPL/SCDL
         out_seg, embedding = self.decoder(features)
-        
-        #for i in range(len(features)):
-        #    print(features[i].shape)
-        #print(out_seg.shape, embedding.shape)
-        #os.exit()
         return out_seg, embedding  # 4, 16, 96, 96, 96
 
 

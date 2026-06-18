@@ -23,6 +23,8 @@ from networks.vnet import VNet
 from torch import nn
 import os
 from GALoss import GADice, GACE
+from utils.vapl import ProjectionHead, CompositionalSimilarityLoss
+from utils.scdl import SemanticClassDistributionLoss
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_name', type=str, default='Synapse', help='dataset_name')
@@ -48,6 +50,9 @@ parser.add_argument('--consistency_type', type=str, default="mse", help='consist
 parser.add_argument('--consistency', type=float, default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float, default=200.0, help='consistency_rampup')
 parser.add_argument('--T_dist', type=float, default=1.0, help='Temperature for organ-class distribution')
+parser.add_argument('--lambda_vapl', type=float, default=0.1, help='weight for VAPL compositional similarity loss')
+parser.add_argument('--lambda_scdl', type=float, default=0.0, help='weight for SCDL proxy distribution loss (0=disabled)')
+parser.add_argument('--embedding_dim', type=int, default=256, help='VAPL/SCDL embedding dimension')
 args = parser.parse_args()
 
 
@@ -197,8 +202,39 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
 
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn)
 
-    optimizer_A = optim.SGD(model_A.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
-    optimizer_B = optim.SGD(model_B.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+    # VAPL/SCDL modules — applied to labeled data only; x6 features from VNet decoder (128ch, 1/8 res)
+    vapl_feature_channels = 128  # n_filters=16 → block_six output has 16*8=128 channels
+    proj_head_A = ProjectionHead(
+        in_channels=vapl_feature_channels, embedding_dim=args.embedding_dim, spatial_dims=3
+    ).cuda()
+    proj_head_B = ProjectionHead(
+        in_channels=vapl_feature_channels, embedding_dim=args.embedding_dim, spatial_dims=3
+    ).cuda()
+    cs_loss_A = CompositionalSimilarityLoss(
+        num_classes=num_classes, embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+    cs_loss_B = CompositionalSimilarityLoss(
+        num_classes=num_classes, embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+    scdl_loss_A = SemanticClassDistributionLoss(
+        in_channels=vapl_feature_channels, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+    scdl_loss_B = SemanticClassDistributionLoss(
+        in_channels=vapl_feature_channels, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+
+    optimizer_A = optim.SGD(
+        list(model_A.parameters()) + list(proj_head_A.parameters())
+        + list(cs_loss_A.parameters()) + list(scdl_loss_A.parameters()),
+        lr=base_lr, momentum=0.9, weight_decay=0.0001,
+    )
+    optimizer_B = optim.SGD(
+        list(model_B.parameters()) + list(proj_head_B.parameters())
+        + list(cs_loss_B.parameters()) + list(scdl_loss_B.parameters()),
+        lr=base_lr, momentum=0.9, weight_decay=0.0001,
+    )
 
     writer = SummaryWriter(snapshot_path_tmp)
     logging.info("{} itertations per epoch".format(len(trainloader)))
@@ -234,8 +270,13 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             labeled_volume_batch = volume_batch[:labeled_bs]
 
 
-            output_A = model_A(volume_batch)
-            output_B = model_B(volume_batch) 
+            use_vapl = args.lambda_vapl > 0 or args.lambda_scdl > 0
+            if use_vapl:
+                output_A, feat_A = model_A(volume_batch, return_features=True)
+                output_B, feat_B = model_B(volume_batch, return_features=True)
+            else:
+                output_A = model_A(volume_batch)
+                output_B = model_B(volume_batch)
 
 
             outputs_A_soft = F.softmax(output_A, dim=1)
@@ -248,7 +289,19 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             loss_seg = ce_loss(output_A[:labeled_bs], label_l.unsqueeze(1)) + ce_loss(output_B[:labeled_bs], label_l.unsqueeze(1))
             loss_seg_dice = dice_loss(outputs_A_soft[:labeled_bs], label_l) + dice_loss(outputs_B_soft[:labeled_bs], label_l)
             loss_sup = loss_seg + loss_seg_dice
-            
+
+            if use_vapl and args.lambda_vapl > 0:
+                emb_A = proj_head_A(feat_A[:labeled_bs])
+                emb_B = proj_head_B(feat_B[:labeled_bs])
+                loss_vapl_A, _ = cs_loss_A(emb_A, label_l)
+                loss_vapl_B, _ = cs_loss_B(emb_B, label_l)
+                loss_sup = loss_sup + args.lambda_vapl * (loss_vapl_A + loss_vapl_B)
+
+            if use_vapl and args.lambda_scdl > 0:
+                loss_scdl_A, _, _ = scdl_loss_A(feat_A[:labeled_bs], label_l)
+                loss_scdl_B, _, _ = scdl_loss_B(feat_B[:labeled_bs], label_l)
+                loss_sup = loss_sup + args.lambda_scdl * (loss_scdl_A + loss_scdl_B)
+
             loss_cps = ce_loss_k100(output_A, max_B) + ce_loss_k100(output_B, max_A)
             
             # loss prop
@@ -269,6 +322,9 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
                                                        loss,
                                                        loss_sup,
                                                        loss_cps, cps_w))
+                if use_vapl:
+                    logging.info('  VAPL lambda_vapl={:.2f} lambda_scdl={:.2f}'.format(
+                        args.lambda_vapl, args.lambda_scdl))
 
             if iter_num >= max_iterations:
                 iter_n = max_iterations - 1

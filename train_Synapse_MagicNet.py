@@ -20,6 +20,8 @@ from utils import metrics, ramps, test_util, cube_losses, cube_utils
 from dataloaders.dataset import *
 from networks.magicnet import VNet_Magic
 from GALoss import GADice, GACE
+from utils.vapl import ProjectionHead, CompositionalSimilarityLoss
+from utils.scdl import SemanticClassDistributionLoss
 
 
 parser = argparse.ArgumentParser()
@@ -44,6 +46,9 @@ parser.add_argument('--consistency_type', type=str, default="mse", help='consist
 parser.add_argument('--consistency', type=float, default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float, default=200.0, help='consistency_rampup')
 parser.add_argument('--T_dist', type=float, default=1.0, help='Temperature for organ-class distribution')
+parser.add_argument('--lambda_vapl', type=float, default=0.1, help='weight for VAPL compositional similarity loss')
+parser.add_argument('--lambda_scdl', type=float, default=0.0, help='weight for SCDL proxy distribution loss (0=disabled)')
+parser.add_argument('--embedding_dim', type=int, default=256, help='VAPL/SCDL embedding dimension')
 args = parser.parse_args()
 
 
@@ -157,7 +162,24 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
         random.seed(args.seed + worker_id)
 
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn)
-    optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+    # VAPL/SCDL modules — applied to labeled data only; x6 features from MagicNet decoder (128ch, 1/8 res)
+    vapl_feature_channels = 128  # n_filters=16 → block_six output has 16*8=128 channels
+    proj_head = ProjectionHead(
+        in_channels=vapl_feature_channels, embedding_dim=args.embedding_dim, spatial_dims=3
+    ).cuda()
+    cs_loss_vapl = CompositionalSimilarityLoss(
+        num_classes=num_classes, embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+    scdl_loss = SemanticClassDistributionLoss(
+        in_channels=vapl_feature_channels, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, ignore_index=255
+    ).cuda()
+
+    optimizer = optim.SGD(
+        list(model.parameters()) + list(proj_head.parameters())
+        + list(cs_loss_vapl.parameters()) + list(scdl_loss.parameters()),
+        lr=base_lr, momentum=0.9, weight_decay=0.0001,
+    )
 
     writer = SummaryWriter(snapshot_path_tmp)
     logging.info("{} itertations per epoch".format(len(trainloader)))
@@ -187,7 +209,11 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             labeled_volume_batch = volume_batch[:labeled_bs]
 
             model.train()
-            outputs = model(volume_batch)[0] # Original Model Outputs
+            use_vapl = args.lambda_vapl > 0 or args.lambda_scdl > 0
+            if use_vapl:
+                outputs, _, feat_vapl = model(volume_batch, return_features=True)
+            else:
+                outputs = model(volume_batch)[0]  # Original Model Outputs
 
             # Cross-image Partition-and-Recovery
             bs, c, w, h, d = volume_batch.shape
@@ -229,6 +255,15 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             
             
             supervised_loss = (loss_seg + loss_seg_dice + loss_unmix_dice)
+
+            if use_vapl and args.lambda_vapl > 0:
+                emb_vapl = proj_head(feat_vapl[:labeled_bs])
+                loss_vapl, _ = cs_loss_vapl(emb_vapl, label_batch[:labeled_bs])
+                supervised_loss = supervised_loss + args.lambda_vapl * loss_vapl
+
+            if use_vapl and args.lambda_scdl > 0:
+                loss_scdl_val, _, _ = scdl_loss(feat_vapl[:labeled_bs], label_batch[:labeled_bs])
+                supervised_loss = supervised_loss + args.lambda_scdl * loss_scdl_val
             count_ss = 3
 
             # Magic-cube Location Reasoning

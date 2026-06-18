@@ -204,7 +204,7 @@ class VNet(nn.Module):
 
         return res
 
-    def decoder(self, features):
+    def decoder(self, features, return_features=False):
         x1 = features[0]
         x2 = features[1]
         x3 = features[2]
@@ -230,14 +230,16 @@ class VNet(nn.Module):
         if self.has_dropout:
             x9 = self.dropout(x9)
         out = self.out_conv(x9)
+        if return_features:
+            return out, x6  # x6: 128ch at 1/8 resolution, used by VAPL/SCDL
         return out
 
-    def forward(self, input, turnoff_drop=False):
+    def forward(self, input, turnoff_drop=False, return_features=False):
         if turnoff_drop:
             has_dropout = self.has_dropout
             self.has_dropout = False
         features = self.encoder(input)
-        out = self.decoder(features)
+        out = self.decoder(features, return_features=return_features)
         if turnoff_drop:
             self.has_dropout = has_dropout
         return out
