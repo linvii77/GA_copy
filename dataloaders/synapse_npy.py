@@ -16,11 +16,18 @@ from torch.utils.data import Dataset
 
 
 def _load_npy(npy_dir: str, case_id: str):
-    """加载单个样本，预处理并返回 (image, label) numpy float32。"""
+    """加载单个样本，预处理并返回 (image, label) numpy float32。
+
+    npy 文件存储为 (D, H, W)，转置为 (H, W, D) 以匹配 h5 训练格式，
+    保证训练 patch 轴向与验证一致（slice 轴在 dim 2）。
+    """
     img = np.load(f"{npy_dir}/{case_id}_image.npy").astype(np.float32)
     lbl = np.load(f"{npy_dir}/{case_id}_label.npy").astype(np.float32)
     img = np.clip(img, -125.0, 275.0)
     img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    # (D=80, H=160, W=160) → (H=160, W=160, D=80) 匹配 h5 轴向
+    img = img.transpose(1, 2, 0)
+    lbl = lbl.transpose(1, 2, 0)
     return img, lbl
 
 
