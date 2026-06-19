@@ -97,7 +97,7 @@ class FusedProxyLoss(nn.Module):
         embeddings = F.normalize(self.projector(features), p=2, dim=1)  # [B, D, sD, sH, sW]
         flat_all = embeddings.movedim(1, -1).reshape(-1, self.embedding_dim)  # [N_all, D]
 
-        g_all = self._compute_g(flat_all)                     # [N_all, C]
+        g_all = self._cdba_compute_g(flat_all)               # [N_all, C] — μ/σ detached
         loss_e2p, loss_p2e = self._cdba_loss(g_all)
         loss_cdba = loss_e2p + loss_p2e
 
@@ -166,6 +166,36 @@ class FusedProxyLoss(nn.Module):
         )  # [N, C]
 
         return rep_term + self.lambda_var * var_term  # [N, C]
+
+    def _cdba_compute_g(self, z: torch.Tensor) -> torch.Tensor:
+        """g for CDBA path: μ and σ are detached so CDBA only trains projector + variation_vectors."""
+        mu, sigma = self._proxy_params()
+        mu = mu.detach()
+        sigma = sigma.detach()
+
+        noise = torch.randn(
+            self.num_classes, self.proxy_samples, self.embedding_dim,
+            device=mu.device, dtype=mu.dtype,
+        )
+        samples = F.normalize(
+            mu.unsqueeze(1) + sigma.unsqueeze(1) * noise, p=2, dim=-1
+        )
+        samples_flat = samples.view(self.num_classes * self.proxy_samples, self.embedding_dim)
+        rep_term = (
+            torch.matmul(z, samples_flat.t())
+            .view(-1, self.num_classes, self.proxy_samples)
+            .mean(dim=2)
+        )
+
+        var_norm = F.normalize(self.variation_vectors, p=2, dim=-1)
+        var_flat = var_norm.view(self.num_classes * self.num_variations, self.embedding_dim)
+        var_term = (
+            torch.matmul(z, var_flat.t())
+            .view(-1, self.num_classes, self.num_variations)
+            .max(dim=2).values
+        )
+
+        return rep_term + self.lambda_var * var_term
 
     def _cdba_loss(
         self, g: torch.Tensor
