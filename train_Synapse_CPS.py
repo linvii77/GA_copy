@@ -182,12 +182,21 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
     model_A = kaiming_normal_init_weight(model_A)
     model_B = xavier_normal_init_weight(model_B)
 
-    db_train = Synapse_fast(labeled_list, unlabeled_list,
-                    base_dir=train_data_path,
-                    transform=transforms.Compose([
-                        RandomCrop(patch_size),
-                        ToTensor(),
-                    ]))
+    if args.data_format == 'npy':
+        from dataloaders.synapse_npy import Synapse_fast_npy
+        db_train = Synapse_fast_npy(labeled_list, unlabeled_list,
+                        base_dir=args.npy_dir,
+                        transform=transforms.Compose([
+                            RandomCrop(patch_size),
+                            ToTensor(),
+                        ]))
+    else:
+        db_train = Synapse_fast(labeled_list, unlabeled_list,
+                        base_dir=train_data_path,
+                        transform=transforms.Compose([
+                            RandomCrop(patch_size),
+                            ToTensor(),
+                        ]))
 
     labelnum = args.labelnum
     labeled_idxs = list(range(len(unlabeled_list)*2))
@@ -336,7 +345,9 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
                                                                                     image_list=eval_list,
                                                                                     patch_size=patch_size,
                                                                                     stride_xy=80,
-                                                                                    stride_z=64)
+                                                                                    stride_z=64,
+                                                                                    data_format=args.data_format,
+                                                                                    npy_dir=args.npy_dir)
                 dice_avg = dice_all.mean()
 
                 logging.info('iteration {}, '
@@ -420,7 +431,7 @@ if __name__ == "__main__":
     model_B = create_model(n_classes=num_classes)
     model_B.load_state_dict(torch.load(best_model_path_B))
     model_B.eval()
-    _, _, metric_final = test_util_vnet_AB.validation_all_case(model_A, model_B, num_classes=num_classes, base_dir=train_data_path, image_list=test_list, patch_size=patch_size, stride_xy=32, stride_z=16)
+    _, _, metric_final = test_util_vnet_AB.validation_all_case(model_A, model_B, num_classes=num_classes, base_dir=train_data_path, image_list=test_list, patch_size=patch_size, stride_xy=32, stride_z=16, data_format=args.data_format, npy_dir=args.npy_dir)
 
     # 12x4x13
     # 4x13, 4x13

@@ -20,13 +20,27 @@ def getLargestCC(segmentation):
     return largestCC
 
 
-def validation_all_case(model_A, model_B, num_classes, base_dir, image_list, patch_size=(96, 96, 96), stride_xy=16, stride_z=16):
+def _load_case(base_dir, case_idx, data_format='h5', npy_dir=None):
+    if data_format == 'npy':
+        img = np.load('{}/{}_image.npy'.format(npy_dir, case_idx)).astype(np.float32)
+        lbl = np.load('{}/{}_label.npy'.format(npy_dir, case_idx)).astype(np.float32)
+        img = np.clip(img, -125.0, 275.0)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        # npy: (D, H, W) → transpose to (H, W, D) to match h5 layout
+        img = img.transpose(1, 2, 0)
+        lbl = lbl.transpose(1, 2, 0)
+        return img, lbl
+    else:
+        image_path = base_dir + '/{}.h5'.format(case_idx)
+        h5f = h5py.File(image_path, 'r')
+        return h5f['image'][:], h5f['label'][:]
+
+
+def validation_all_case(model_A, model_B, num_classes, base_dir, image_list, patch_size=(96, 96, 96), stride_xy=16, stride_z=16, data_format='h5', npy_dir=None):
     loader = tqdm(image_list)
     total_metric = []
     for case_idx in loader:
-        image_path = base_dir + '/{}.h5'.format(case_idx)
-        h5f = h5py.File(image_path, 'r')
-        image, gt_mask = h5f['image'][:], h5f['label'][:]
+        image, gt_mask = _load_case(base_dir, case_idx, data_format, npy_dir)
         prediction, score_map = test_single_case_fast(model_A, model_B, image, stride_xy, stride_z, patch_size, num_classes=num_classes)
 
         prediction = torch.FloatTensor(prediction).unsqueeze(0).unsqueeze(0)
@@ -49,13 +63,11 @@ def validation_all_case(model_A, model_B, num_classes, base_dir, image_list, pat
     avg_dice, std_dice = np.mean(all_metric, axis=0)[0], np.std(all_metric, axis=0)[0]
     return avg_dice, std_dice, all_metric
 
-def validation_all_case_fast(model_A, model_B, num_classes, base_dir, image_list, patch_size=(96, 96, 96), stride_xy=16, stride_z=16):
+def validation_all_case_fast(model_A, model_B, num_classes, base_dir, image_list, patch_size=(96, 96, 96), stride_xy=16, stride_z=16, data_format='h5', npy_dir=None):
     loader = tqdm(image_list)
     total_metric = []
     for case_idx in loader:
-        image_path = base_dir + '/{}.h5'.format(case_idx)
-        h5f = h5py.File(image_path, 'r')
-        image, gt_mask = h5f['image'][:], h5f['label'][:]
+        image, gt_mask = _load_case(base_dir, case_idx, data_format, npy_dir)
         prediction, score_map = test_single_case_fast(model_A, model_B, image, stride_xy, stride_z, patch_size, num_classes=num_classes)
         if np.sum(prediction) == 0:
             case_metric = np.zeros((1, num_classes - 1))
