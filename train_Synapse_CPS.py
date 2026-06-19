@@ -258,7 +258,8 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
 
 
             use_fused = args.lambda_cdba > 0 or args.lambda_sac > 0
-            if use_fused:
+            need_features = use_fused  # SAC needs features from iter 0
+            if need_features:
                 output_A, feat_A = model_A(volume_batch, return_features=True)
                 output_B, feat_B = model_B(volume_batch, return_features=True)
             else:
@@ -275,14 +276,17 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             loss_seg_dice = dice_loss(outputs_A_soft[:labeled_bs], label_l) + dice_loss(outputs_B_soft[:labeled_bs], label_l)
             loss_sup = loss_seg + loss_seg_dice
 
-            # FusedProxy: CDBA on all pixels (no labels needed) + SAC on labeled only
-            fused_active = use_fused and iter_num >= args.vapl_warmup
-            if fused_active:
+            # FusedProxy: SAC runs from iter 0 (labeled-only, supervised, safe)
+            #             CDBA activates only after vapl_warmup (unlabeled-facing, needs grounded proxies)
+            sac_active  = use_fused and args.lambda_sac > 0
+            cdba_active = use_fused and args.lambda_cdba > 0 and iter_num >= args.vapl_warmup
+            if sac_active or cdba_active:
                 loss_cdba_A, loss_sac_A, stats_A = fused_proxy_A(feat_A, label_l, labeled_bs)
                 loss_cdba_B, loss_sac_B, stats_B = fused_proxy_B(feat_B, label_l, labeled_bs)
-                loss_sup = (loss_sup
-                            + args.lambda_cdba * (loss_cdba_A + loss_cdba_B)
-                            + args.lambda_sac  * (loss_sac_A  + loss_sac_B))
+                if sac_active:
+                    loss_sup = loss_sup + args.lambda_sac * (loss_sac_A + loss_sac_B)
+                if cdba_active:
+                    loss_sup = loss_sup + args.lambda_cdba * (loss_cdba_A + loss_cdba_B)
 
             loss_cps = ce_loss_k100(output_A, max_B) + ce_loss_k100(output_B, max_A)
             
@@ -304,11 +308,12 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
                                                        loss,
                                                        loss_sup,
                                                        loss_cps, cps_w))
-                if use_fused and fused_active:
+                if sac_active or cdba_active:
                     logging.info(
-                        '  FusedProxy cdba_A={:.4f}(e2p={:.4f},p2e={:.4f}) sac_A={:.4f} g_pos={:.4f}'.format(
+                        '  FusedProxy cdba_A={:.4f}(e2p={:.4f},p2e={:.4f}) sac_A={:.4f}'
+                        ' g_pos={:.4f} sac_on={} cdba_on={}'.format(
                             stats_A.loss_cdba, stats_A.loss_e2p, stats_A.loss_p2e,
-                            stats_A.loss_sac, stats_A.g_pos_mean))
+                            stats_A.loss_sac, stats_A.g_pos_mean, sac_active, cdba_active))
 
             if iter_num >= max_iterations:
                 iter_n = max_iterations - 1
