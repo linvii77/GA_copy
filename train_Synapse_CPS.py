@@ -23,8 +23,7 @@ from networks.vnet import VNet
 from torch import nn
 import os
 from GALoss import GADice, GACE
-from utils.vapl import ProjectionHead, CompositionalSimilarityLoss
-from utils.scdl import SemanticClassDistributionLoss
+from utils.fused_proxy import FusedProxyLoss
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_name', type=str, default='Synapse', help='dataset_name')
@@ -50,13 +49,11 @@ parser.add_argument('--consistency_type', type=str, default="mse", help='consist
 parser.add_argument('--consistency', type=float, default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float, default=200.0, help='consistency_rampup')
 parser.add_argument('--T_dist', type=float, default=1.0, help='Temperature for organ-class distribution')
-parser.add_argument('--lambda_vapl', type=float, default=0.1, help='weight for VAPL compositional similarity loss')
-parser.add_argument('--lambda_scdl', type=float, default=0.0, help='weight for SCDL proxy distribution loss (0=disabled)')
-parser.add_argument('--embedding_dim', type=int, default=256, help='VAPL/SCDL embedding dimension')
-parser.add_argument('--vapl_warmup', type=int, default=0, help='skip VAPL/SCDL for the first N iterations')
-parser.add_argument('--lambda_vapl_pseudo', type=float, default=0.0, help='VAPL weight on unlabeled data via CPS pseudo-labels')
-parser.add_argument('--lambda_scdl_pseudo', type=float, default=0.0, help='SCDL weight on unlabeled data via CPS pseudo-labels')
-parser.add_argument('--vapl_conf_thresh', type=float, default=0.75, help='confidence threshold for pseudo-label VAPL filtering')
+parser.add_argument('--lambda_cdba', type=float, default=0.1, help='weight for CDBA (E2P+P2E) loss')
+parser.add_argument('--lambda_sac', type=float, default=0.05, help='weight for SAC (anchor) loss')
+parser.add_argument('--lambda_var', type=float, default=1.0, help='lambda_var inside g(z,c): weight of var_term vs rep_term')
+parser.add_argument('--embedding_dim', type=int, default=256, help='FusedProxy embedding dimension')
+parser.add_argument('--vapl_warmup', type=int, default=0, help='skip FusedProxy loss for the first N iterations')
 args = parser.parse_args()
 
 
@@ -206,37 +203,23 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
 
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn)
 
-    # VAPL/SCDL modules — applied to labeled data only; x6 features from VNet decoder (128ch, 1/8 res)
-    vapl_feature_channels = 128  # n_filters=16 → block_six output has 16*8=128 channels
-    proj_head_A = ProjectionHead(
-        in_channels=vapl_feature_channels, embedding_dim=args.embedding_dim, spatial_dims=3
+    # FusedProxyLoss — x6 features from VNet decoder (128ch, 1/8 res)
+    fused_feature_channels = 128
+    fused_proxy_A = FusedProxyLoss(
+        in_channels=fused_feature_channels, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, lambda_var=args.lambda_var, ignore_index=255,
     ).cuda()
-    proj_head_B = ProjectionHead(
-        in_channels=vapl_feature_channels, embedding_dim=args.embedding_dim, spatial_dims=3
-    ).cuda()
-    cs_loss_A = CompositionalSimilarityLoss(
-        num_classes=num_classes, embedding_dim=args.embedding_dim, ignore_index=255
-    ).cuda()
-    cs_loss_B = CompositionalSimilarityLoss(
-        num_classes=num_classes, embedding_dim=args.embedding_dim, ignore_index=255
-    ).cuda()
-    scdl_loss_A = SemanticClassDistributionLoss(
-        in_channels=vapl_feature_channels, num_classes=num_classes,
-        embedding_dim=args.embedding_dim, ignore_index=255
-    ).cuda()
-    scdl_loss_B = SemanticClassDistributionLoss(
-        in_channels=vapl_feature_channels, num_classes=num_classes,
-        embedding_dim=args.embedding_dim, ignore_index=255
+    fused_proxy_B = FusedProxyLoss(
+        in_channels=fused_feature_channels, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, lambda_var=args.lambda_var, ignore_index=255,
     ).cuda()
 
     optimizer_A = optim.SGD(
-        list(model_A.parameters()) + list(proj_head_A.parameters())
-        + list(cs_loss_A.parameters()) + list(scdl_loss_A.parameters()),
+        list(model_A.parameters()) + list(fused_proxy_A.parameters()),
         lr=base_lr, momentum=0.9, weight_decay=0.0001,
     )
     optimizer_B = optim.SGD(
-        list(model_B.parameters()) + list(proj_head_B.parameters())
-        + list(cs_loss_B.parameters()) + list(scdl_loss_B.parameters()),
+        list(model_B.parameters()) + list(fused_proxy_B.parameters()),
         lr=base_lr, momentum=0.9, weight_decay=0.0001,
     )
 
@@ -274,15 +257,13 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             labeled_volume_batch = volume_batch[:labeled_bs]
 
 
-            use_vapl = (args.lambda_vapl > 0 or args.lambda_scdl > 0
-                        or args.lambda_vapl_pseudo > 0 or args.lambda_scdl_pseudo > 0)
-            if use_vapl:
+            use_fused = args.lambda_cdba > 0 or args.lambda_sac > 0
+            if use_fused:
                 output_A, feat_A = model_A(volume_batch, return_features=True)
                 output_B, feat_B = model_B(volume_batch, return_features=True)
             else:
                 output_A = model_A(volume_batch)
                 output_B = model_B(volume_batch)
-
 
             outputs_A_soft = F.softmax(output_A, dim=1)
             outputs_B_soft = F.softmax(output_B, dim=1)
@@ -290,46 +271,18 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             max_B = torch.argmax(output_B.detach(), dim=1, keepdim=True).long()
             label_l = label_batch[:labeled_bs]
 
-
             loss_seg = ce_loss(output_A[:labeled_bs], label_l.unsqueeze(1)) + ce_loss(output_B[:labeled_bs], label_l.unsqueeze(1))
             loss_seg_dice = dice_loss(outputs_A_soft[:labeled_bs], label_l) + dice_loss(outputs_B_soft[:labeled_bs], label_l)
             loss_sup = loss_seg + loss_seg_dice
 
-            # VAPL/SCDL only active after warmup period
-            vapl_active = use_vapl and iter_num >= args.vapl_warmup
-
-            if vapl_active and args.lambda_vapl > 0:
-                emb_A = proj_head_A(feat_A[:labeled_bs])
-                emb_B = proj_head_B(feat_B[:labeled_bs])
-                loss_vapl_A, _ = cs_loss_A(emb_A, label_l)
-                loss_vapl_B, _ = cs_loss_B(emb_B, label_l)
-                loss_sup = loss_sup + args.lambda_vapl * (loss_vapl_A + loss_vapl_B)
-
-            if vapl_active and args.lambda_scdl > 0:
-                loss_scdl_A, _, _ = scdl_loss_A(feat_A[:labeled_bs], label_l)
-                loss_scdl_B, _, _ = scdl_loss_B(feat_B[:labeled_bs], label_l)
-                loss_sup = loss_sup + args.lambda_scdl * (loss_scdl_A + loss_scdl_B)
-
-            # VAPL/SCDL on unlabeled data via CPS pseudo-labels (confidence-filtered)
-            if vapl_active and (args.lambda_vapl_pseudo > 0 or args.lambda_scdl_pseudo > 0):
-                conf_B_u = outputs_B_soft[labeled_bs:].max(dim=1).values  # [bs_u,H,W,D]
-                conf_A_u = outputs_A_soft[labeled_bs:].max(dim=1).values
-                pseudo_for_A_u = max_B[labeled_bs:, 0].clone()            # [bs_u,H,W,D]
-                pseudo_for_B_u = max_A[labeled_bs:, 0].clone()
-                pseudo_for_A_u[conf_B_u < args.vapl_conf_thresh] = 255
-                pseudo_for_B_u[conf_A_u < args.vapl_conf_thresh] = 255
-
-                if args.lambda_vapl_pseudo > 0:
-                    emb_A_u = proj_head_A(feat_A[labeled_bs:])
-                    emb_B_u = proj_head_B(feat_B[labeled_bs:])
-                    loss_vapl_A_u, _ = cs_loss_A(emb_A_u, pseudo_for_A_u)
-                    loss_vapl_B_u, _ = cs_loss_B(emb_B_u, pseudo_for_B_u)
-                    loss_sup = loss_sup + args.lambda_vapl_pseudo * (loss_vapl_A_u + loss_vapl_B_u)
-
-                if args.lambda_scdl_pseudo > 0:
-                    loss_scdl_A_u, _, _ = scdl_loss_A(feat_A[labeled_bs:], pseudo_for_A_u)
-                    loss_scdl_B_u, _, _ = scdl_loss_B(feat_B[labeled_bs:], pseudo_for_B_u)
-                    loss_sup = loss_sup + args.lambda_scdl_pseudo * (loss_scdl_A_u + loss_scdl_B_u)
+            # FusedProxy: CDBA on all pixels (no labels needed) + SAC on labeled only
+            fused_active = use_fused and iter_num >= args.vapl_warmup
+            if fused_active:
+                loss_cdba_A, loss_sac_A, stats_A = fused_proxy_A(feat_A, label_l, labeled_bs)
+                loss_cdba_B, loss_sac_B, stats_B = fused_proxy_B(feat_B, label_l, labeled_bs)
+                loss_sup = (loss_sup
+                            + args.lambda_cdba * (loss_cdba_A + loss_cdba_B)
+                            + args.lambda_sac  * (loss_sac_A  + loss_sac_B))
 
             loss_cps = ce_loss_k100(output_A, max_B) + ce_loss_k100(output_B, max_A)
             
@@ -351,13 +304,11 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
                                                        loss,
                                                        loss_sup,
                                                        loss_cps, cps_w))
-                if use_vapl:
+                if use_fused and fused_active:
                     logging.info(
-                        '  VAPL vapl={:.3f} scdl={:.3f} vapl_pl={:.3f} scdl_pl={:.3f}'
-                        ' warmup={} active={}'.format(
-                            args.lambda_vapl, args.lambda_scdl,
-                            args.lambda_vapl_pseudo, args.lambda_scdl_pseudo,
-                            args.vapl_warmup, vapl_active))
+                        '  FusedProxy cdba_A={:.4f}(e2p={:.4f},p2e={:.4f}) sac_A={:.4f} g_pos={:.4f}'.format(
+                            stats_A.loss_cdba, stats_A.loss_e2p, stats_A.loss_p2e,
+                            stats_A.loss_sac, stats_A.g_pos_mean))
 
             if iter_num >= max_iterations:
                 iter_n = max_iterations - 1
