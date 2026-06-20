@@ -54,8 +54,6 @@ parser.add_argument('--lambda_sac', type=float, default=0.05, help='weight for S
 parser.add_argument('--lambda_var', type=float, default=1.0, help='lambda_var inside g(z,c): weight of var_term vs rep_term')
 parser.add_argument('--embedding_dim', type=int, default=256, help='FusedProxy embedding dimension')
 parser.add_argument('--vapl_warmup', type=int, default=0, help='skip FusedProxy loss for the first N iterations')
-parser.add_argument('--lambda_fused_pseudo', type=float, default=0.0, help='FusedProxy weight on pseudo-labeled unlabeled data')
-parser.add_argument('--vapl_conf_thresh', type=float, default=0.75, help='confidence threshold for pseudo-label filtering')
 parser.add_argument('--data_format', type=str, default='h5', choices=['h5', 'npy'], help='h5=本地, npy=HPC')
 parser.add_argument('--npy_dir', type=str, default='', help='npy 数据目录（data_format=npy 时使用）')
 args = parser.parse_args()
@@ -300,19 +298,6 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
                     loss_sup = loss_sup + args.lambda_sac * (loss_sac_A + loss_sac_B)
                 if cdba_active:
                     loss_sup = loss_sup + args.lambda_cdba * (loss_cdba_A + loss_cdba_B)
-
-            # C1: FusedProxy pseudo-label extension (unlabeled data, confidence-filtered)
-            if (use_fused and args.lambda_fused_pseudo > 0
-                    and iter_num >= args.vapl_warmup):
-                conf_B_u = outputs_B_soft[labeled_bs:].max(dim=1).values
-                conf_A_u = outputs_A_soft[labeled_bs:].max(dim=1).values
-                pseudo_for_A_u = max_B[labeled_bs:, 0].clone()
-                pseudo_for_B_u = max_A[labeled_bs:, 0].clone()
-                pseudo_for_A_u[conf_B_u < args.vapl_conf_thresh] = 255
-                pseudo_for_B_u[conf_A_u < args.vapl_conf_thresh] = 255
-                loss_fp_A = fused_proxy_A.forward_pseudo(feat_A[labeled_bs:], pseudo_for_A_u)
-                loss_fp_B = fused_proxy_B.forward_pseudo(feat_B[labeled_bs:], pseudo_for_B_u)
-                loss_sup = loss_sup + args.lambda_fused_pseudo * (loss_fp_A + loss_fp_B)
 
             loss_cps = ce_loss_k100(output_A, max_B) + ce_loss_k100(output_B, max_A)
             

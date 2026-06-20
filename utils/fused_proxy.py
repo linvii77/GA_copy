@@ -127,24 +127,6 @@ class FusedProxyLoss(nn.Module):
         )
         return loss_cdba, loss_sac, stats
 
-    def forward_pseudo(
-        self,
-        features_u: torch.Tensor,
-        pseudo_labels: torch.Tensor,
-    ) -> torch.Tensor:
-        """FusedProxy CE loss on pseudo-labeled unlabeled pixels.
-
-        Proxy (μ/σ) is detached so pseudo-label noise only trains the projector.
-        _flatten_valid auto-excludes ignore_index=255 (low-confidence pixels).
-        """
-        embeddings = F.normalize(self.projector(features_u), p=2, dim=1)
-        targets = self._resize_targets(pseudo_labels, embeddings.shape[2:])
-        flat_emb, flat_tgt = self._flatten_valid(embeddings, targets)
-        if flat_emb.numel() == 0:
-            return features_u.sum() * 0.0
-        g = self._cdba_compute_g(flat_emb)   # proxies detached
-        return F.cross_entropy(g, flat_tgt)
-
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
