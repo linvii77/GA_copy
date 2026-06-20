@@ -54,6 +54,10 @@ parser.add_argument('--lambda_sac', type=float, default=0.05, help='weight for S
 parser.add_argument('--lambda_var', type=float, default=1.0, help='lambda_var inside g(z,c): weight of var_term vs rep_term')
 parser.add_argument('--embedding_dim', type=int, default=256, help='FusedProxy embedding dimension')
 parser.add_argument('--vapl_warmup', type=int, default=0, help='skip FusedProxy loss for the first N iterations')
+parser.add_argument('--tau_var', type=float, default=10.0, help='logsumexp temperature for variation term in g(z,c)')
+parser.add_argument('--max_samples_per_class', type=int, default=None, help='class-balanced voxel cap for SAC (None=disable)')
+parser.add_argument('--variation_warmup', type=int, default=0, help='iter before variation sub-distribution activates')
+parser.add_argument('--conf_threshold', type=float, default=0.0, help='confidence threshold for CPS pseudo-labels (0=disable)')
 parser.add_argument('--data_format', type=str, default='h5', choices=['h5', 'npy'], help='h5=本地, npy=HPC')
 parser.add_argument('--npy_dir', type=str, default='', help='npy 数据目录（data_format=npy 时使用）')
 args = parser.parse_args()
@@ -219,10 +223,16 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
     fused_proxy_A = FusedProxyLoss(
         in_channels=fused_feature_channels, num_classes=num_classes,
         embedding_dim=args.embedding_dim, lambda_var=args.lambda_var, ignore_index=255,
+        tau_var=args.tau_var,
+        max_samples_per_class=args.max_samples_per_class,
+        variation_warmup_iters=args.variation_warmup,
     ).cuda()
     fused_proxy_B = FusedProxyLoss(
         in_channels=fused_feature_channels, num_classes=num_classes,
         embedding_dim=args.embedding_dim, lambda_var=args.lambda_var, ignore_index=255,
+        tau_var=args.tau_var,
+        max_samples_per_class=args.max_samples_per_class,
+        variation_warmup_iters=args.variation_warmup,
     ).cuda()
 
     optimizer_A = optim.SGD(
@@ -281,6 +291,11 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             outputs_B_soft = F.softmax(output_B, dim=1)
             max_A = torch.argmax(output_A.detach(), dim=1, keepdim=True).long()
             max_B = torch.argmax(output_B.detach(), dim=1, keepdim=True).long()
+            if args.conf_threshold > 0.0:
+                prob_A = torch.softmax(output_A.detach(), dim=1).max(dim=1, keepdim=True).values
+                prob_B = torch.softmax(output_B.detach(), dim=1).max(dim=1, keepdim=True).values
+                max_A[prob_A < args.conf_threshold] = -100  # GACE ignore_index=-100
+                max_B[prob_B < args.conf_threshold] = -100
             label_l = label_batch[:labeled_bs]
 
             loss_seg = ce_loss(output_A[:labeled_bs], label_l.unsqueeze(1)) + ce_loss(output_B[:labeled_bs], label_l.unsqueeze(1))

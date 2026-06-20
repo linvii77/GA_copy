@@ -55,6 +55,9 @@ class FusedProxyLoss(nn.Module):
         proxy_samples: int = 8,
         ignore_index: int = 255,
         eps: float = 1e-7,
+        tau_var: float = 10.0,
+        max_samples_per_class: int | None = None,
+        variation_warmup_iters: int = 0,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -64,6 +67,9 @@ class FusedProxyLoss(nn.Module):
         self.proxy_samples = proxy_samples
         self.ignore_index = ignore_index
         self.eps = eps
+        self.tau_var = tau_var
+        self.max_samples_per_class = max_samples_per_class
+        self.variation_warmup_iters = variation_warmup_iters
 
         self.projector = nn.Sequential(
             nn.Conv3d(in_channels, embedding_dim, kernel_size=1, bias=False),
@@ -84,20 +90,24 @@ class FusedProxyLoss(nn.Module):
         features: torch.Tensor,
         label_l: torch.Tensor | None = None,
         labeled_bs: int = 0,
+        iter_num: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, FusedProxyStats]:
         """
         Args:
             features:   [B, C_in, D, H, W]  raw backbone features (full batch)
             label_l:    [labeled_bs, D, H, W] ground-truth labels (labeled portion only)
             labeled_bs: number of labeled samples in features
+            iter_num:   current training iteration (for variation warmup gate)
 
         Returns:
             loss_cdba, loss_sac, FusedProxyStats
         """
+        use_var = (self.lambda_var > 0) and (iter_num >= self.variation_warmup_iters)
+
         embeddings = F.normalize(self.projector(features), p=2, dim=1)  # [B, D, sD, sH, sW]
         flat_all = embeddings.movedim(1, -1).reshape(-1, self.embedding_dim)  # [N_all, D]
 
-        g_all = self._cdba_compute_g(flat_all)               # [N_all, C] — μ/σ detached
+        g_all = self._cdba_compute_g(flat_all, use_var=use_var)  # [N_all, C] — μ/σ detached
         loss_e2p, loss_p2e = self._cdba_loss(g_all)
         loss_cdba = loss_e2p + loss_p2e
 
@@ -110,8 +120,9 @@ class FusedProxyLoss(nn.Module):
             flat_emb_l, flat_tgt_l = self._flatten_valid(emb_labeled, targets)
 
             if flat_emb_l.numel() > 0:
-                loss_sac = self._sac_loss(flat_emb_l, flat_tgt_l)
-                g_l = self._compute_g(flat_emb_l)
+                flat_emb_l_bal, flat_tgt_l_bal = self._balance_sample(flat_emb_l, flat_tgt_l)
+                loss_sac = self._sac_loss(flat_emb_l_bal, flat_tgt_l_bal)
+                g_l = self._compute_g(flat_emb_l, use_var=use_var)
                 arange = torch.arange(flat_tgt_l.numel(), device=flat_tgt_l.device)
                 g_pos_mean = g_l[arange, flat_tgt_l].detach().mean()
 
@@ -136,7 +147,7 @@ class FusedProxyLoss(nn.Module):
         sigma = F.softplus(self.proxies[:, self.embedding_dim:]).clamp_min(self.eps)
         return mu, sigma
 
-    def _compute_g(self, z: torch.Tensor) -> torch.Tensor:
+    def _compute_g(self, z: torch.Tensor, use_var: bool = True) -> torch.Tensor:
         """g(z, c) for every pixel z and every class c.  Returns [N, C]."""
         mu, sigma = self._proxy_params()   # [C, D], [C, D]
 
@@ -156,18 +167,21 @@ class FusedProxyLoss(nn.Module):
             .mean(dim=2)
         )  # [N, C]
 
-        # var_term: hard-max cosine to variation vectors  →  forces specialisation
+        if not use_var or self.lambda_var == 0:
+            return rep_term
+
+        # var_term: logsumexp cosine to variation vectors — trains all K vectors (vs hard-max)
         var_norm = F.normalize(self.variation_vectors, p=2, dim=-1)  # [C, K, D]
         var_flat = var_norm.view(self.num_classes * self.num_variations, self.embedding_dim)
-        var_term = (
+        var_sims = (
             torch.matmul(z, var_flat.t())
             .view(-1, self.num_classes, self.num_variations)
-            .max(dim=2).values
-        )  # [N, C]
+        )  # [N, C, K]
+        var_term = torch.logsumexp(self.tau_var * var_sims, dim=2) / self.tau_var  # [N, C]
 
         return rep_term + self.lambda_var * var_term  # [N, C]
 
-    def _cdba_compute_g(self, z: torch.Tensor) -> torch.Tensor:
+    def _cdba_compute_g(self, z: torch.Tensor, use_var: bool = True) -> torch.Tensor:
         """g for CDBA path: μ and σ are detached so CDBA only trains projector + variation_vectors."""
         mu, sigma = self._proxy_params()
         mu = mu.detach()
@@ -187,13 +201,16 @@ class FusedProxyLoss(nn.Module):
             .mean(dim=2)
         )
 
+        if not use_var or self.lambda_var == 0:
+            return rep_term
+
         var_norm = F.normalize(self.variation_vectors, p=2, dim=-1)
         var_flat = var_norm.view(self.num_classes * self.num_variations, self.embedding_dim)
-        var_term = (
+        var_sims = (
             torch.matmul(z, var_flat.t())
             .view(-1, self.num_classes, self.num_variations)
-            .max(dim=2).values
         )
+        var_term = torch.logsumexp(self.tau_var * var_sims, dim=2) / self.tau_var
 
         return rep_term + self.lambda_var * var_term
 
@@ -211,6 +228,27 @@ class FusedProxyLoss(nn.Module):
         loss_p2e = torch.exp(-margin).mean()
 
         return loss_e2p, loss_p2e
+
+    def _balance_sample(
+        self,
+        embeddings: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.max_samples_per_class is None:
+            return embeddings, targets
+        indices = []
+        for c in range(self.num_classes):
+            idx = (targets == c).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            if idx.numel() > self.max_samples_per_class:
+                perm = torch.randperm(idx.numel(), device=idx.device)[:self.max_samples_per_class]
+                idx = idx[perm]
+            indices.append(idx)
+        if not indices:
+            return embeddings, targets
+        sel = torch.cat(indices)
+        return embeddings[sel], targets[sel]
 
     def _sac_loss(
         self,
