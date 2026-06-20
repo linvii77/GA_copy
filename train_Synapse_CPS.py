@@ -292,8 +292,8 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             sac_active  = use_fused and args.lambda_sac > 0
             cdba_active = use_fused and args.lambda_cdba > 0 and iter_num >= args.vapl_warmup
             if sac_active or cdba_active:
-                loss_cdba_A, loss_sac_A, stats_A = fused_proxy_A(feat_A, label_l, labeled_bs)
-                loss_cdba_B, loss_sac_B, stats_B = fused_proxy_B(feat_B, label_l, labeled_bs)
+                loss_cdba_A, loss_sac_A, stats_A = fused_proxy_A(feat_A, label_l, labeled_bs, iter_num=iter_num)
+                loss_cdba_B, loss_sac_B, stats_B = fused_proxy_B(feat_B, label_l, labeled_bs, iter_num=iter_num)
                 if sac_active:
                     loss_sup = loss_sup + args.lambda_sac * (loss_sac_A + loss_sac_B)
                 if cdba_active:
