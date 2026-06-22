@@ -428,7 +428,7 @@ if __name__ == "__main__":
         os.chmod(snapshot_path, stat.S_IRWXU+stat.S_IRWXG+stat.S_IRWXO)
     if os.path.exists(snapshot_path + '/GALoss'):
         shutil.rmtree(snapshot_path + '/GALoss')
-    shutil.copytree('.', snapshot_path + '/GALoss', ignore=shutil.ignore_patterns('.git', '__pycache__', 'data', 'model', 'logs'))
+    shutil.copytree('.', snapshot_path + '/GALoss', ignore=shutil.ignore_patterns('.git', '__pycache__', 'data', 'model', 'logs', 'BIBM_medical', 'checkpoints'))
 
 
     metric_final, best_model_path_A, best_model_path_B = train(labeled_list, unlabeled_list, eval_list)
