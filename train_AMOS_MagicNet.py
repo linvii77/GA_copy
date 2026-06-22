@@ -20,6 +20,7 @@ from utils import metrics, ramps, test_amos, cube_losses, cube_utils
 from dataloaders.dataset import *
 from networks.magicnet import VNet_Magic
 from GALoss import GADice, GACE
+from utils.fused_proxy import FusedProxyLoss
 
 
 parser = argparse.ArgumentParser()
@@ -44,6 +45,14 @@ parser.add_argument('--consistency_type', type=str, default="mse", help='consist
 parser.add_argument('--consistency', type=float, default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float, default=200.0, help='consistency_rampup')
 parser.add_argument('--T_dist', type=float, default=1.0, help='Temperature for organ-class distribution')
+parser.add_argument('--lambda_cdba', type=float, default=0.05, help='weight for CDBA loss')
+parser.add_argument('--lambda_sac', type=float, default=0.2, help='weight for SAC anchor loss')
+parser.add_argument('--lambda_var', type=float, default=1.0, help='lambda_var inside g(z,c)')
+parser.add_argument('--embedding_dim', type=int, default=256, help='FusedProxy embedding dimension')
+parser.add_argument('--vapl_warmup', type=int, default=3000, help='iter before CDBA activates')
+parser.add_argument('--tau_var', type=float, default=5.0, help='logsumexp temperature for variation term')
+parser.add_argument('--max_samples_per_class', type=int, default=200, help='class-balanced voxel cap for SAC')
+parser.add_argument('--variation_warmup', type=int, default=3000, help='iter before variation sub-distribution activates')
 args = parser.parse_args()
 
 
@@ -91,7 +100,7 @@ else:
 eval_list = read_list('eval')
 test_list = read_list('test')
 
-snapshot_path = args.save_path + "/{}_{}_GA_{}labeled".format(args.dataset_name, args.exp, args.labelnum)
+snapshot_path = args.save_path + "/{}_{}_GA_{}labeled_seed_{}".format(args.dataset_name, args.exp, args.labelnum, args.seed)
 print(snapshot_path)
 
 num_classes = 16
@@ -164,8 +173,18 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
 
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn)
 
-    optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
-    # optimizer = optim.Adam(model.parameters(), lr=base_lr)
+    fused_proxy = FusedProxyLoss(
+        in_channels=128, num_classes=num_classes,
+        embedding_dim=args.embedding_dim, lambda_var=args.lambda_var, ignore_index=255,
+        tau_var=args.tau_var,
+        max_samples_per_class=args.max_samples_per_class,
+        variation_warmup_iters=args.variation_warmup,
+    ).cuda()
+
+    optimizer = optim.SGD(
+        list(model.parameters()) + list(fused_proxy.parameters()),
+        lr=base_lr, momentum=0.9, weight_decay=0.0001,
+    )
 
     writer = SummaryWriter(snapshot_path_tmp)
     logging.info("{} itertations per epoch".format(len(trainloader)))
@@ -196,7 +215,11 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             labeled_volume_batch = volume_batch[:labeled_bs]
 
             model.train()
-            outputs = model(volume_batch)[0] # Original Model Outputs
+            use_fused = args.lambda_cdba > 0 or args.lambda_sac > 0
+            if use_fused:
+                outputs, _, feat_vapl = model(volume_batch, return_features=True)
+            else:
+                outputs = model(volume_batch)[0]  # Original Model Outputs
 
             # Cross-image Partition-and-Recovery
             bs, c, w, h, d = volume_batch.shape
@@ -312,6 +335,20 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             consistency_loss += consistency_loss_unmix
 
             supervised_loss /= count_ss
+
+            # ── FusedProxy (E2) ──────────────────────────────────────────
+            sac_active  = use_fused and args.lambda_sac > 0
+            cdba_active = use_fused and args.lambda_cdba > 0 and iter_num >= args.vapl_warmup
+            if sac_active or cdba_active:
+                loss_cdba, loss_sac, fp_stats = fused_proxy(
+                    feat_vapl, label_batch[:labeled_bs], labeled_bs, iter_num=iter_num
+                )
+                if sac_active:
+                    supervised_loss = supervised_loss + args.lambda_sac * loss_sac
+                if cdba_active:
+                    supervised_loss = supervised_loss + args.lambda_cdba * loss_cdba
+            # ─────────────────────────────────────────────────────────────
+
             consistency_loss /= count_consist
 
             # Final Loss
@@ -326,13 +363,19 @@ def train(labeled_list, unlabeled_list, eval_list, fold_id=1):
             iter_num = iter_num + 1
 
             if iter_num % 100 == 0:
+                fp_log = ''
+                if sac_active or cdba_active:
+                    fp_log = '  FusedProxy cdba={:.4f} sac={:.4f} g_pos={:.4f} sac_on={} cdba_on={}'.format(
+                        fp_stats.loss_cdba, fp_stats.loss_sac, fp_stats.g_pos_mean,
+                        sac_active, cdba_active)
                 logging.info('Fold {}, iteration {}: loss: {:.4f}, '
                              'cons_dist: {:.4f}, loss_weight: {:4f}, '
-                             'loss_loc: {:.4f}'.format(fold_id, iter_num,
-                                                       loss,
-                                                       consistency_loss,
-                                                       consistency_weight,
-                                                       0.1 * loc_loss))
+                             'loss_loc: {:.4f}{}'.format(fold_id, iter_num,
+                                                         loss,
+                                                         consistency_loss,
+                                                         consistency_weight,
+                                                         0.1 * loc_loss,
+                                                         fp_log))
             lr_ = base_lr * (1.0 - iter_num / 70000) ** 0.9 
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_
